@@ -1,0 +1,172 @@
+---
+title: "Frequentist_Final"
+author: "Dehua Bi"
+date: "08/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Frequentist
+
+### BH approach
+
+```{r}
+wt <- 0.3
+
+sample_ve <- function(N, wt, G=2){
+  # Follow a rejection sampling framework
+  # g(theta) = beta(0.5, 0.5)
+  # M = 1.1
+  accept_num = 0
+  sampled_ve_list = rep(NA, N)
+  while(accept_num < N){
+    theta_samp <- rbeta(1, 0.5, 0.5)
+    rej_ratio <- (wt*dbeta(theta_samp, 2, 1)*1/2 +
+                    (1-wt)*(1-dbeta(theta_samp, 3, 2)/2)) / 
+      (dbeta(theta_samp, 0.5, 0.5) * G)
+    if(runif(1) < rej_ratio){
+      accept_num = accept_num + 1
+      sampled_ve_list[accept_num] <- theta_samp
+    }
+  }
+  return(sampled_ve_list)
+}
+
+simseq <- function(N, chortsize, wt, alpha_bound_list,
+                   q_star = 0.05, nsim_trail = 1000){
+  # generate the probabilities for nsim trials
+  p2 <- rbeta(nsim_trail, 354, 34245)
+  VE <- sample_ve(nsim_trail, wt)
+  p1 <- p2*(1-VE)
+  
+  # estimated status
+  status_list <- rep(NA, nsim_trail)
+  real_status <- rep(NA, nsim_trail)
+  stopped <- rep(NA, nsim_trail)
+  
+  for(i in 1:nsim_trail){
+    # generate the data from a trial, 0 means uninfected, 1 means infected
+    y_placebo <- rbinom(N, 1, p2[i])
+    y_treat <- rbinom(N, 1, p1[i])
+    
+    # p-value lists
+    #p_val_ef <- rep(NA, ceiling(N/chortsize))
+    #p_val_fu <- rep(NA, ceiling(N/chortsize))
+    
+    an_list <- rep(NA, ceiling(N/chortsize)-1)
+    p_greater_val_list <- rep(NA, ceiling(N/chortsize)-1)
+    
+    # Select a decision boundary
+    # Try with Haybittle
+    alpha_star <- alpha_bound_list
+    
+    status = 0
+    
+    for(j in 1:(ceiling(N/chortsize)-1)){
+      N_j <- j*chortsize
+      x1n <- sum(y_treat[1:N_j])
+      # The y(n)
+      yn <- sum(y_treat[1:N_j]) + sum(y_placebo[1:N_j])
+      
+      # Under H0: VE <= 30%
+      # The a(n)
+      an <- yn*(0.7/1.7)
+      an_list[j] <- an
+      z_val <- 0
+      if(j == 1){
+        z_val = (x1n - an)/sqrt(an*(1-(0.7/1.7)))
+      }else{
+        N_jm1 <- (j-1)*chortsize
+        x1n_p = x1n - sum(y_treat[1:N_jm1])
+        an_p = an - an_list[j-1]
+        z_val = (x1n_p - an_p)/sqrt(an_p*(1-(0.7/1.7)))
+        #an_p = an - sum(y_treat[1:N_jm1])
+        #if(an_p <= 0) z_val = 10000 # some large value
+        #else z_val = (x1n_p - an_p)/sqrt(an_p*(1-(0.7/1.7)))
+      }
+      
+      # Pr(x_1^(n) <= a_n)
+      p_xn_val = pnorm(z_val, lower.tail = TRUE)
+      
+      if(j == 1){
+        # Pr(x_1^(1) <= a_1) <= alpha_star_(1)
+        if(p_xn_val <= alpha_star[j]){
+          status = 2
+          stopped[i] <- N_j
+          break
+        }else p_greater_val_list[j] <- 1-p_xn_val
+      }else{
+        # Pr(x_1^(1) > a_1,...,x_(j-1)^(1) <= a_(j-1), x_1^(j) <= a_j)
+        # by joint distribution
+        p_xn_val_all = p_xn_val*exp(sum(log(p_greater_val_list[1:(j-1)])))
+        if(p_xn_val_all <= alpha_star[j]){
+          status = 2
+          stopped[i] <- N_j
+          break
+        }else p_greater_val_list[j] <- 1-p_xn_val
+      }
+    }
+    # if by the end, it is still 0, then that means we fail to reject all
+    # check the end and see if we can reject it
+    if(status == 0){
+      stopped[i] <- N
+      x1n <- sum(y_treat)
+      yn <- sum(y_treat) + sum(y_placebo)
+      z_val <- (x1n - yn*(0.7/1.7))/sqrt(yn*(0.7/1.7)*(1-(0.7/1.7)))
+      p_val <- pnorm(z_val, lower.tail = TRUE)
+      if(p_val < q_star){
+        status = 2
+      }else status = 1
+    }
+    
+    status_list[i] <- status
+    
+    if(VE[i] < 0.3){
+      real_status[i] = 1
+    }else real_status[i] = 2
+    
+  }
+  
+  list(truth = real_status, estimate = status_list, stopped = stopped)
+}
+
+alpha_bound_list <- c(0.01, 0.01, 0.01, 0.01, 0.01)
+
+#simseq <- function(N, chortsize, wt, alpha_bound_list,
+#                   q_star = 0.05, nsim_trail = 1000, 
+#                   nsim_sim = 1000)
+z <- simseq(18000, 3000, wt, alpha_bound_list, nsim_trail = 10000)
+
+# Some summary statistics
+ta <- fr <- fa <- tr <- 0
+early_stop <- 0
+for(i in 1:length(z$truth)){
+  # Record the fa, ta, fr, tr
+  if(z$truth[i] == z$estimate[i] && z$truth[i]== 2){
+    ta = ta + 1
+  }else if(z$truth[i] == z$estimate[i] && z$truth[i]== 1){
+    tr = tr + 1
+  }else if(z$truth[i] != z$estimate[i] && z$truth[i]== 2){
+    fr = fr + 1
+  }else if(z$truth[i] != z$estimate[i] && z$truth[i]== 1){
+    fa = fa + 1
+  }
+  # Record the stopping condition
+  if(z$stopped[i] < 18000){
+    early_stop = early_stop + 1
+  }
+}
+
+far <- sum(fa)/(sum(fa)+sum(tr))
+tar <- sum(ta)/(sum(ta)+sum(fr))
+frr <- sum(fr)/(sum(fr)+sum(ta))
+
+print(far)
+print(tar)
+print(frr)
+print(early_stop)
+
+```

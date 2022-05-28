@@ -1,0 +1,789 @@
+---
+title: "Bayesian_Final Code"
+author: "Dehua Bi"
+date: "13/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Reproduce Blog Code
+
+```{r}
+library(Hmisc)
+library(rms)
+
+# Prior data
+sd1 <- 1 / qnorm(1 - 0.1)
+sd2 <- 0.25 / qnorm(1 - 0.05)
+wt <- 0.5
+pdensity <- function(x) wt * dnorm(x, 0, sd1) + (1 - wt) * dnorm(x, 0, sd2)
+x <- seq(-3, 3, length = 200)
+
+simseq <- function(N, prior.mu = 0, prior.sd, wt, mucut = 0, mucutf = 0.05,
+                   postcut = 0.95, postcutf = 0.9, ignore = 20, nsim = 1000){
+  prior.mu <- rep(prior.mu, length = 2)
+  prior.sd <- rep(prior.sd, length = 2)
+  sd1 <- prior.sd[1]; sd2 <- prior.sd[2]
+  v1 <- sd1 ^ 2
+  v2 <- sd2 ^ 2
+  j <- 1 : N
+  cmean <- Mu <- PostN <- Post <- Postf <- postfe <- postmean <- numeric(nsim)
+  stopped <- stoppedi <- stoppedf <- stoppedfu <- stopfe <- status <- integer(nsim)
+  notignored <- - (1 : ignore) # Problem here, this will be the last several data, not
+                               # the ignore+1 : end
+  pmean <- gbayesMixPost(NA, NA, d0 = prior.mu[1], d1 = prior.mu[2],
+                         v0 = v1, v1 = v2, mix = wt, what = 'postmean')
+  
+  for(i in 1:nsim){
+    component <- if(wt == 1) 1 else sample(1:2, size = 1, prob=c(wt, 1.-wt))
+    mu <- prior.mu[component] + rnorm(1) * prior.sd[component]
+    
+    Mu[i] <- mu
+    y <- rnorm(N, mean = mu, sd = 1)
+    ybar <- cumsum(y) / j
+    pcdf <- gbayesMixPost(ybar, 1. / j, d0 = prior.mu[1], d1 = prior.mu[2],
+                          v0 = v1, v1 = v2, mix = wt, what = 'cdf')
+    post <- 1 - pcdf(mucut)
+    PostN[i] <- post[N]
+    postf <- pcdf(mucutf)
+    s <- stopped[i] <- if(max(post) < postcut) N else min(which(post >= postcut))
+    Post[i] <- post[s]
+    cmean[i] <- ybar[s]
+    
+    postmean[i] <- pmean(x = ybar[s], v = 1./s)
+    
+    stoppedi[i] <- if(max(post[notignored]) < postcut) N
+    else
+      ignore + min(which(post[notignored] >= postcut))
+    
+    stoppedf[i] <- if(max(post) < postcut & max(postf) < postcutf) N
+    else
+      min(which(post >= postcut | postf >= postcutf))
+    
+    s <- if(max(postf) < postcutf) N else min(which(postf >= postcutf))
+    Postf[i] <- postf[s]
+    stoppedfu[i] <- s
+    
+    stp <- post >= postcut | postf >= postcutf
+    s <- stopfe[i] <- if(any(stp)) min(which(stp)) else N
+    status[i] <- if(any(stp)) ifelse(postf[s] >= postcutf, 1, 2) else 0
+    postfe[i] <- if(any(stp)) ifelse(status[i] == 2, post[s], postf[s]) else post[N]
+  }
+  list(mu = Mu, post = Post, postn = PostN, postf = Postf, stopped = stopped,
+       stoppedi = stoppedi, stoppedf = stoppedf, stoppedfu = stoppedfu, 
+       cmean = cmean, postmean = postmean, postfe = postfe, status = status,
+       stopfe = stopfe)
+}
+
+set.seed(1)
+z <- simseq(500, prior.mu = 0, prior.sd = c(sd1, sd2), wt = wt, postcut = 0.95,
+            postcutf = 0.9, nsim = 100000)
+mu <- z$mu
+post <- z$post
+postn <- z$postn
+st <- z$stopped
+sti <- z$stoppedi
+stf <- z$stoppedf
+stfu <- z$stoppedfu
+cmean <- z$cmean
+postmean <- z$postmean
+postf <- z$postf
+status <- z$status
+postfe <- z$postfe
+rmean <- function(x) formatNP(mean(x), digits = 3)
+k <- status == 2
+kf <- status == 1
+
+# Trials stopped early for efficacy
+print(sum(k))
+# Trails stopped early for futility
+print(sum(kf))
+# Average post prob. of efficacy at stopping for efficacy:
+print(mean(postfe[k]))
+# Of trails stopped early for efficacy, proportion with mu > 0
+print(sum((mu[status == 2] > 0))/sum(k))
+# Average post prob. of futility at stopping for futility:
+print(mean(postf[kf]))
+# Of trails stopped early for futility, proportion with mu < 0.05
+print(sum((mu[status == 1] < 0.05))/sum(kf))
+```
+
+## Code for research
+
+### Final Bayesian Code (after Friday OH)
+
+```{r}
+library(tidyverse)
+
+wt <- 0.3
+
+sample_ve <- function(N, wt){
+  sampled_ve_list = rep(NA, N)
+  for(i in 1:N){
+    if(runif(1) < wt){
+      # sample from the first part
+      X <- rbeta(1,2,1)
+      sampled_ve_list[i] = 0.5*X
+    }else{
+      X <- rbeta(1,3,2)
+      sampled_ve_list[i] = 1-0.5*X
+    }
+  }
+  return(sampled_ve_list)
+}
+
+simseq <- function(N, chortsize, wt, vecut = 0.5, vecutf = 0.3, 
+                   postcut = 0.95, postcutf = 0.95, 
+                   nsim_trail = 1000, nsim_sim = 1000){
+  
+  postf <- postfe <- numeric(nsim_trail)
+  stopped <- status <- integer(nsim_trail)
+  ee <- ef <- ei <- fe <- ff <- fi <- ie <- i_f <- ii <- rep(0, nsim_trail)
+  
+  # generate the probabilities for nsim trials
+  p2 <- rbeta(nsim_trail, 354, 34245)
+  VE <- sample_ve(nsim_trail, wt)
+  p1 <- p2*(1-VE)
+  
+  # Running through the simulated clinical trials
+  for(i in 1:nsim_trail){
+    # generate the data from a trial, 0 means uninfected, 1 means infected
+    y_placebo <- rbinom(N, 1, p2[i])
+    y_treat <- rbinom(N, 1, p1[i])
+    
+    # By cohort
+    # Status: 0 no decision, 1 futility, 2 efficacious
+    for(j in 1:ceiling(N/chortsize)){
+      N_j <- j*chortsize
+      y_p <- y_placebo[1:N_j]
+      y_t <- y_treat[1:N_j]
+      # Posterior
+      post_p <- rbeta(nsim_sim, sum(y_p)+1, N_j-sum(y_p)+1)
+      post_t <- rbeta(nsim_sim, sum(y_t)+1, N_j-sum(y_t)+1)
+      post_VE <- rep(1, nsim_sim) - (post_t / post_p)
+      # Efficacy, stop if Pr(VE(n) > vecut|data) > postcut
+      post_VE_cutprob <- sum(post_VE > vecut) / nsim_sim
+      if(post_VE_cutprob > postcut){
+        # Stop the trial and record the values
+        stopped[i] <- N_j
+        status[i] <- 2
+        postfe[i] <- mean(post_VE)
+        break
+      }
+      # Futility, stop if Pr(VE(n) < vecutf|data) > postcutf
+      post_VE_cutfprob <- sum(post_VE < vecutf) / nsim_sim
+      if(post_VE_cutfprob > postcutf){
+        # Stop the trial and record the values
+        stopped[i] <- N_j
+        status[i] <- 1
+        postf[i] <- mean(post_VE)
+        break
+      }
+      # Reach the end
+      if(N_j == N){
+        # This is the undermined case
+        status[i] <- 0
+        stopped[i] <- N
+      }
+    }
+    
+    # signal true approval, false approval and false refusal
+    # the true status
+    true_status <- 0
+    if(VE[i] > 0.5) true_status = 2 
+    else if(VE[i] < 0.3) true_status = 1
+    # the estimated status
+    est_status = status[i]
+    
+    
+    # Estimate\Truth  | Effi  | Futi  | inconslusive
+    #----------------------------------------
+    #    Effi         |  ee   |  ef   |  ei
+    #----------------------------------------
+    #    Futi         |  fe   |  ff   |  fi
+    #----------------------------------------
+    #   inconslusive  |  ie   |  i_f  |  ii
+    
+    if(true_status == est_status && est_status == 0){
+      ii[i] <- 1
+    }else if(true_status == est_status && est_status == 1){
+      ff[i] <- 1
+    }else if(true_status == est_status && est_status == 2){
+      ee[i] <- 1
+    }else if(true_status == 0 && est_status == 1){
+      fi[i] <- 1
+    }else if(true_status == 0 && est_status == 2){
+      ei[i] <- 1
+    }else if(true_status == 1 && est_status == 0){
+      i_f[i] <- 1
+    }else if(true_status == 1 && est_status == 2){
+      ef[i] <- 1
+    }else if(true_status == 2 && est_status == 0){
+      ie[i] <- 1
+    }else if(true_status == 2 && est_status == 1){
+      fe[i] <- 1
+    }
+    
+  }
+  
+  list(postf = postf, postfe = postfe, stopped = stopped,
+       status = status, truth = true_status, 
+       ee = sum(ee), ef = sum(ef), ei = sum(ei),
+       fe = sum(fe), ff = sum(ff), fi = sum(fi), 
+       ie = sum(ie), i_f = sum(i_f), ii = sum(ii))
+        
+}
+
+z <- simseq(18000, 3000, 0.3, nsim_trail = 10000)
+
+# Print 3 by 3 table
+three_by_three_table <- tibble(
+  E_T = c("Effi", "Futi", "Inc"),
+  Effi = c(z$ee, z$fe, z$ie),
+  Futi = c(z$ef, z$ff, z$i_f),
+  Inc = c(z$ei, z$fi, z$ii)
+)
+print(three_by_three_table)
+
+# FAR: false approval rate
+#             number of false approval                    ef + ei
+# -------------------------------------------------- = --------------
+# number of false approval + number of true approval   ef + ei + ee
+FAR <- (z$ef + z$ei)/(z$ef + z$ei + z$ee)
+print(paste("The FAR is:", FAR))
+
+# TAR: true approval rate
+#             number of true approval                       ee
+# -------------------------------------------------- = --------------
+# number of true approval + number of false approval   ef + ei + ee
+TAR <- z$ee/(z$ef + z$ei + z$ee)
+print(paste("The TAR is:", TAR))
+
+# FRR: false refusal rate
+#             number of false refusal                    fe + fi
+# -------------------------------------------------- = --------------
+# number of false refusal + number of true refusal     fe + ff + fi
+FRR <- (z$fe + z$fi)/(z$fe + z$ff + z$fi)
+print(paste("The FRR is:", FRR))
+
+# Null: VE < 0.3
+
+# Estimate\Truth       | Effi + inc (False) | Futi (True) 
+#------------------------------------------------------------
+#    Effi + inc (Rej)  |  ee + ei + ie + ii |  ef + i_f 
+#------------------------------------------------------------
+#    Futi (Fail Rej)   |  fe + fi           |  ff   
+
+# Type I error = Dec Rej & Null true / (Dec Rej & Null true + Dec Fail Rej & Null True)
+#              = (ef + i_f) / (ef + i_f + ff)
+
+typeI <- (z$ef + z$i_f)/(z$ef + z$i_f + z$ff)
+print(paste("The Type I error under the null of VE < 0.3 is:", typeI))
+
+# Type II error = Dec fail Rej & Null false / (Dec fail Rej & Null false + Dec Rej & Null false)
+#               = (fe + fi) / (fe + fi + ee + ei + ie + ii)
+
+typeII <- (z$fe + z$fi)/(z$fe + z$fi + z$ee + z$ei + z$ie + z$ii)
+print(paste("The Type II error under the null of VE < 0.3 is:", typeII))
+
+# Bayesian Type I and Type II
+
+# Estimate\Truth  | Effi  | Futi  | inconslusive
+#----------------------------------------
+#    Effi         |  ee   |  ef   |  ei
+#----------------------------------------
+#    Futi         |  fe   |  ff   |  fi
+#----------------------------------------
+#   inconslusive  |  ie   |  i_f  |  ii
+
+# Null: VE >= 0.3
+# Estimate\Truth       | Effi + inc (True) | Futi (False) 
+#------------------------------------------------------------
+# Effi + inc (Fail Rej)|  ee + ei + ie + ii |  ef + i_f 
+#------------------------------------------------------------
+#    Futi (Rej)        |  fe + fi           |  ff  
+
+# Type I error = Dec Rej & Null true / (Dec Rej & Null true + Dec Fail Rej & Null True)
+#              = (fe + fi) / (fe + fi + ee + ei + ie + ii)
+
+bayes_fu_typeI <- (z$fe + z$fi)/(z$fe + z$fi + z$ee + z$ei + z$ie + z$ii)
+print(paste("The Type I error under the null of VE >= 0.3 is:", bayes_fu_typeI))
+
+# Type II error = Dec fail Rej & Null false / (Dec fail Rej & Null false + Dec Rej & Null false)
+#               = (ef + i_f) / (ef + i_f + ff)
+
+bayes_fu_typeII <- (z$ef + z$i_f)/(z$ef + z$i_f + z$ff)
+print(paste("The Type II error under the null of VE >= 0.3 is:", bayes_fu_typeII))
+
+# Null: VE <= 0.5
+# Estimate\Truth       | Futi + inc (True)   | Effi (False) 
+#------------------------------------------------------------
+# Futi + inc (Fail Rej)|  ff + fi + i_f + ii |  fe + ie 
+#------------------------------------------------------------
+#    Effi (Rej)        |  ef + ei            |  ee  
+
+# Type I error = Dec Rej & Null true / (Dec Rej & Null true + Dec Fail Rej & Null True)
+#              = (ef + ei) / (ef + ei + ff + fi + i_f + ii)
+
+bayes_eff_typeI <- (z$ef + z$ei)/(z$ef + z$ei + z$ff + z$fi + z$i_f + z$ii)
+print(paste("The Type I error under the null of VE <= 0.5 is:", bayes_eff_typeI))
+
+# Type II error = Dec fail Rej & Null false / (Dec fail Rej & Null false + Dec Rej & Null false)
+#               = (fe + ie) / (fe + ie + ee)
+
+bayes_eff_typeII <- (z$fe + z$ie)/(z$fe + z$ie + z$ee)
+print(paste("The Type II error under the null of VE <= 0.5 is:", bayes_eff_typeII))
+
+
+status <- z$status
+k <- z$status == 2 & z$stopped < 18000
+kf <- z$status == 1 & z$stopped < 18000
+
+# Trials stopped early for efficacy
+print(paste("The number of trials with early stopping for efficacy is:", sum(k)))
+# Trails stopped early for futility
+print(paste("The number of trials with early stopping for futility is:", sum(kf)))
+# Average post prob. of efficacy at stopping for efficacy:
+#print(paste("The avg post efficacy at early stopping for efficacy is:", mean(z$postfe[k])))
+# Average post prob. of futility at stopping for futility:
+#print(paste("The avg post futility at early stopping for futility is:", mean(z$postf[kf])))
+
+# Print early stopping for each interim
+print("The stopping number of each interim:")
+print(sum(z$stopped == 3000))
+print(sum(z$stopped == 6000))
+print(sum(z$stopped == 9000))
+print(sum(z$stopped == 12000))
+print(sum(z$stopped == 15000))
+print(sum(z$stopped == 18000))
+
+# Average stopping time
+print(paste("Average stopping sample size", mean(z$stopped)))
+
+# Print early stopping for each interim for different status
+# Stop for futility
+print("The stopping number of each interim for futility:")
+print(sum(z$stopped == 3000 & z$status == 1))
+print(sum(z$stopped == 6000 & z$status == 1))
+print(sum(z$stopped == 9000 & z$status == 1))
+print(sum(z$stopped == 12000 & z$status == 1))
+print(sum(z$stopped == 15000 & z$status == 1))
+print(sum(z$stopped == 18000 & z$status == 1))
+
+print(paste("Average stopping sample size for futility early stopping", mean(z$stopped[kf])))
+# Stop for efficicous
+print("The stopping number of each interim for efficacy:")
+print(sum(z$stopped == 3000 & z$status == 2))
+print(sum(z$stopped == 6000 & z$status == 2))
+print(sum(z$stopped == 9000 & z$status == 2))
+print(sum(z$stopped == 12000 & z$status == 2))
+print(sum(z$stopped == 15000 & z$status == 2))
+print(sum(z$stopped == 18000 & z$status == 2))
+
+print(paste("Average stopping sample size for efficacy early stopping", mean(z$stopped[k])))
+
+# Overall accuracy
+# print(sum(z$truth - z$status)/10000)
+```
+
+### test of cut = 0.3
+
+```{r}
+zz <- simseq(18000, 3000, 0.3, vecut = 0.3, nsim_trail = 10000)
+
+# Print 3 by 3 table
+three_by_three_table2 <- tibble(
+  E_T = c("Effi", "Futi", "Inc"),
+  Effi = c(zz$ee, zz$fe, zz$ie),
+  Futi = c(zz$ef, zz$ff, zz$i_f),
+  Inc = c(zz$ei, zz$fi, zz$ii)
+)
+print(three_by_three_table2)
+
+```
+
+
+### Simulation on weight
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+
+
+# simulate various values of wt
+#wt_list <- c(0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+wt_list <- seq(0.03,1,by=0.03)
+
+far_wt_list <- tar_wt_list <- frr_wt_list <- rep(NA, length(wt_list))
+typeI_wt <- typeII_wt <- rep(NA, length(wt_list))
+trial_eff_wt <- trial_fu_wt <- rep(NA, length(wt_list))
+ave_patient_number_eff_wt <- ave_patient_number_fu_wt <- rep(NA, length(wt_list))
+
+for(idx in 1:length(wt_list)){
+  wt <- wt_list[idx]
+  z <- simseq(18000, 3000, wt, nsim_trail = 1000)
+  far_wt_list[idx] <- (z$ef + z$ei)/(z$ef + z$ei + z$ee)
+  tar_wt_list[idx] <- z$ee/(z$ef + z$ei + z$ee)
+  frr_wt_list[idx] <- (z$fe + z$fi)/(z$fe + z$ff + z$fi)
+  typeI_wt[idx] <- (z$ef + z$i_f)/(z$ef + z$i_f + z$ff)
+  typeII_wt[idx] <- (z$fe + z$fi)/(z$fe + z$fi + z$ee + z$ei + z$ie + z$ii)
+  
+  
+  status <- z$status
+  k <- z$status == 2
+  kf <- z$status == 1
+  
+  trial_eff_wt[idx] <- sum(k)
+  trial_fu_wt[idx] <- sum(kf)
+  
+  kk <- z$status == 2 & z$stopped < 18000
+  kkf <- z$status == 1 & z$stopped < 18000
+  
+  ave_patient_number_eff_wt[idx] <- mean(z$stopped[kk])
+  ave_patient_number_fu_wt[idx] <- mean(z$stopped[kkf])
+}
+
+data_rate <- data.frame(wt = wt_list, far = far_wt_list, tar = tar_wt_list, frr = frr_wt_list)
+plot_data_rate <- data_rate %>%
+  pivot_longer(cols = c('far', 'tar', 'frr'), names_to = "rate", values_to = "values")
+
+data_type_err <- data.frame(wt = wt_list, typeI = typeI_wt, typeII = typeII_wt)
+plot_data_err <- data_type_err %>%
+  pivot_longer(cols = c('typeI', 'typeII'), 
+               names_to = "error", values_to = "values")
+
+data_stop <- data.frame(wt = wt_list, efficacy = trial_eff_wt, futility = trial_fu_wt)
+plot_data_stop <- data_stop %>%
+  pivot_longer(cols = c('efficacy', 'futility'), 
+               names_to = "stop", values_to = "values")
+
+data_patient <- data.frame(wt = wt_list, efficacy = ave_patient_number_eff_wt, futility = ave_patient_number_fu_wt)
+plot_data_patient <- data_patient %>%
+  pivot_longer(cols = c('efficacy', 'futility'), 
+               names_to = "patient", values_to = "values")
+
+ggplot(data = plot_data_rate, aes(x = wt, y = values, col = rate)) + 
+  geom_line() +
+  xlab("Weight") + ylab("Error Rate")
+
+ggplot(data = plot_data_err, aes(x = wt, y = values, col = error)) + 
+  geom_line() +
+  xlab("Weight") + ylab("Type I and II errors")
+
+ggplot(data = plot_data_stop, aes(x = wt, y = values, col = stop)) + 
+  geom_line() +
+  xlab("Weight") + ylab("Stopped Number")
+
+ggplot(data = plot_data_patient, aes(x = wt, y = values, col = patient)) + 
+  geom_line() +
+  xlab("Weight") + ylab("Average Patient Number")
+```
+
+### Simulation on efficacy cutoff
+
+```{r}
+# simulate various values of wt
+#eff_cut_list <- c(0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99)
+eff_cut_list <- seq(0.7,1,by = 0.005)
+
+far_wt_list <- tar_wt_list <- frr_wt_list <- rep(NA, length(eff_cut_list))
+typeI_wt <- typeII_wt <- rep(NA, length(eff_cut_list))
+trial_eff_wt <- trial_fu_wt <- rep(NA, length(eff_cut_list))
+ave_patient_number_eff_wt <- ave_patient_number_fu_wt <- rep(NA, length(eff_cut_list))
+
+for(idx in 1:length(eff_cut_list)){
+  pcut <- eff_cut_list[idx]
+  z <- simseq(18000, 3000, 0.3, nsim_trail = 1000, postcut = pcut)
+  far_wt_list[idx] <- (z$ef + z$ei)/(z$ef + z$ei + z$ee)
+  tar_wt_list[idx] <- z$ee/(z$ef + z$ei + z$ee)
+  frr_wt_list[idx] <- (z$fe + z$fi)/(z$fe + z$ff + z$fi)
+  typeI_wt[idx] <- (z$ef + z$i_f)/(z$ef + z$i_f + z$ff)
+  typeII_wt[idx] <- (z$fe + z$fi)/(z$fe + z$fi + z$ee + z$ei + z$ie + z$ii)
+  
+  status <- z$status
+  k <- z$status == 2
+  kf <- z$status == 1
+  
+  trial_eff_wt[idx] <- sum(k)
+  trial_fu_wt[idx] <- sum(kf)
+  
+  kk <- z$status == 2 & z$stopped < 18000
+  kkf <- z$status == 1 & z$stopped < 18000
+  
+  ave_patient_number_eff_wt[idx] <- mean(z$stopped[kk])
+  ave_patient_number_fu_wt[idx] <- mean(z$stopped[kkf])
+}
+
+data_rate <- data.frame(wt = eff_cut_list, far = far_wt_list, tar = tar_wt_list, frr = frr_wt_list)
+plot_data_rate <- data_rate %>%
+  pivot_longer(cols = c('far', 'tar', 'frr'), names_to = "rate", values_to = "values")
+
+data_type_err <- data.frame(wt = eff_cut_list, typeI = typeI_wt, typeII = typeII_wt)
+plot_data_err <- data_type_err %>%
+  pivot_longer(cols = c('typeI', 'typeII'), 
+               names_to = "error", values_to = "values")
+
+data_stop <- data.frame(wt = eff_cut_list, efficacy = trial_eff_wt, futility = trial_fu_wt)
+plot_data_stop <- data_stop %>%
+  pivot_longer(cols = c('efficacy', 'futility'), 
+               names_to = "stop", values_to = "values")
+
+data_patient <- data.frame(wt = eff_cut_list, efficacy = ave_patient_number_eff_wt, futility = ave_patient_number_fu_wt)
+plot_data_patient <- data_patient %>%
+  pivot_longer(cols = c('efficacy', 'futility'), 
+               names_to = "patient", values_to = "values")
+
+ggplot(data = plot_data_rate, aes(x = wt, y = values, col = rate)) + 
+  geom_line() +
+  xlab("Efficacy Posterior Cutoff Probability") + ylab("Error Rate")
+
+ggplot(data = plot_data_err, aes(x = wt, y = values, col = error)) + 
+  geom_line() +
+  xlab("Efficacy Posterior Cutoff Probability") + ylab("Type I and II errors")
+
+ggplot(data = plot_data_stop, aes(x = wt, y = values, col = stop)) + 
+  geom_line() +
+  xlab("Efficacy Posterior Cutoff Probability") + ylab("Stopped Number")
+
+ggplot(data = plot_data_patient, aes(x = wt, y = values, col = patient)) + 
+  geom_line() +
+  xlab("Efficacy Posterior Cutoff Probability") + ylab("Average Patient Number")
+
+```
+
+### Simulation on futility cutoff
+
+```{r}
+# simulate various values of wt
+#fu_cut_list <- c(0.90, 0.91, 0.92, 0.93, 0.94, 0.95, 0.96, 0.97, 0.98, 0.99)
+fu_cut_list <- seq(0.7,1,by = 0.005)
+
+far_wt_list <- tar_wt_list <- frr_wt_list <- rep(NA, length(fu_cut_list))
+typeI_wt <- typeII_wt <- rep(NA, length(fu_cut_list))
+trial_eff_wt <- trial_fu_wt <- rep(NA, length(fu_cut_list))
+ave_patient_number_eff_wt <- ave_patient_number_fu_wt <- rep(NA, length(fu_cut_list))
+
+for(idx in 1:length(fu_cut_list)){
+  pcutf <- fu_cut_list[idx]
+  z <- simseq(18000, 3000, 0.3, nsim_trail = 1000, postcutf = pcutf)
+  far_wt_list[idx] <- (z$ef + z$ei)/(z$ef + z$ei + z$ee)
+  tar_wt_list[idx] <- z$ee/(z$ef + z$ei + z$ee)
+  frr_wt_list[idx] <- (z$fe + z$fi)/(z$fe + z$ff + z$fi)
+  typeI_wt[idx] <- (z$ef + z$i_f)/(z$ef + z$i_f + z$ff)
+  typeII_wt[idx] <- (z$fe + z$fi)/(z$fe + z$fi + z$ee + z$ei + z$ie + z$ii)
+  
+  status <- z$status
+  k <- z$status == 2
+  kf <- z$status == 1
+  
+  trial_eff_wt[idx] <- sum(k)
+  trial_fu_wt[idx] <- sum(kf)
+  
+  kk <- z$status == 2 & z$stopped < 18000
+  kkf <- z$status == 1 & z$stopped < 18000
+  
+  ave_patient_number_eff_wt[idx] <- mean(z$stopped[kk])
+  ave_patient_number_fu_wt[idx] <- mean(z$stopped[kkf])
+}
+
+data_rate <- data.frame(wt = fu_cut_list, far = far_wt_list, tar = tar_wt_list, frr = frr_wt_list)
+plot_data_rate <- data_rate %>%
+  pivot_longer(cols = c('far', 'tar', 'frr'), names_to = "rate", values_to = "values")
+
+data_type_err <- data.frame(wt = fu_cut_list, typeI = typeI_wt, typeII = typeII_wt)
+plot_data_err <- data_type_err %>%
+  pivot_longer(cols = c('typeI', 'typeII'), 
+               names_to = "error", values_to = "values")
+
+data_stop <- data.frame(wt = fu_cut_list, efficacy = trial_eff_wt, futility = trial_fu_wt)
+plot_data_stop <- data_stop %>%
+  pivot_longer(cols = c('efficacy', 'futility'), 
+               names_to = "stop", values_to = "values")
+
+data_patient <- data.frame(wt = fu_cut_list, efficacy = ave_patient_number_eff_wt, futility = ave_patient_number_fu_wt)
+plot_data_patient <- data_patient %>%
+  pivot_longer(cols = c('efficacy', 'futility'), 
+               names_to = "patient", values_to = "values")
+
+ggplot(data = plot_data_rate, aes(x = wt, y = values, col = rate)) + 
+  geom_line() +
+  xlab("Futility Posterior Cutoff Probability") + ylab("Error Rate")
+
+ggplot(data = plot_data_err, aes(x = wt, y = values, col = error)) + 
+  geom_line() +
+  xlab("Futility Posterior Cutoff Probability") + ylab("Type I and II errors")
+
+ggplot(data = plot_data_stop, aes(x = wt, y = values, col = stop)) + 
+  geom_line() +
+  xlab("Futility Posterior Cutoff Probability") + ylab("Stopped Number")
+
+ggplot(data = plot_data_patient, aes(x = wt, y = values, col = patient)) + 
+  geom_line() +
+  xlab("Futility Posterior Cutoff Probability") + ylab("Average Patient Number")
+
+```
+Here again we use the same method as before, but with hyper parameters.
+Since we are dealing with Covid-19 vaccine, then we would prefer the parameters
+that give lower frr, so we would have higher chance to approve effective
+vaccines. On the other hand, we would also like to use less patients to do
+the test due to ethic reasons, because we don't want people to inject
+futile vaccine. Also, less patients needed to complete the test means time
+and money can be saved.
+
+Lets use wt = 0.2, postcut = 0.85, postcutf = 0.98 
+```{r}
+z <- simseq(18000, 3000, wt = 0.2,postcut = 0.85, postcutf = 0.98, nsim_trail = 10000)
+
+# Print 3 by 3 table
+three_by_three_table <- tibble(
+  E_T = c("Effi", "Futi", "Inc"),
+  Effi = c(z$ee, z$fe, z$ie),
+  Futi = c(z$ef, z$ff, z$i_f),
+  Inc = c(z$ei, z$fi, z$ii)
+)
+print(three_by_three_table)
+
+# FAR: false approval rate
+#             number of false approval                    ef + ei
+# -------------------------------------------------- = --------------
+# number of false approval + number of true approval   ef + ei + ee
+FAR <- (z$ef + z$ei)/(z$ef + z$ei + z$ee)
+print(paste("The FAR is:", FAR))
+
+# TAR: true approval rate
+#             number of true approval                       ee
+# -------------------------------------------------- = --------------
+# number of true approval + number of false approval   ef + ei + ee
+TAR <- z$ee/(z$ef + z$ei + z$ee)
+print(paste("The TAR is:", TAR))
+
+# FRR: false refusal rate
+#             number of false refusal                    fe + fi
+# -------------------------------------------------- = --------------
+# number of false refusal + number of true refusal     fe + ff + fi
+FRR <- (z$fe + z$fi)/(z$fe + z$ff + z$fi)
+print(paste("The FRR is:", FRR))
+
+# Null: VE < 0.3
+
+# Estimate\Truth       | Effi + inc (False) | Futi (True) 
+#------------------------------------------------------------
+#    Effi + inc (Rej)  |  ee + ei + ie + ii |  ef + i_f 
+#------------------------------------------------------------
+#    Futi (Fail Rej)   |  fe + fi           |  ff   
+
+# Type I error = Dec Rej & Null true / (Dec Rej & Null true + Dec Fail Rej & Null True)
+#              = (ef + i_f) / (ef + i_f + ff)
+
+typeI <- (z$ef + z$i_f)/(z$ef + z$i_f + z$ff)
+print(paste("The Type I error under the null of VE < 0.3 is:", typeI))
+
+# Type II error = Dec fail Rej & Null false / (Dec fail Rej & Null false + Dec Rej & Null false)
+#               = (fe + fi) / (fe + fi + ee + ei + ie + ii)
+
+typeII <- (z$fe + z$fi)/(z$fe + z$fi + z$ee + z$ei + z$ie + z$ii)
+print(paste("The Type II error under the null of VE < 0.3 is:", typeII))
+
+# Bayesian Type I and Type II
+
+# Estimate\Truth  | Effi  | Futi  | inconslusive
+#----------------------------------------
+#    Effi         |  ee   |  ef   |  ei
+#----------------------------------------
+#    Futi         |  fe   |  ff   |  fi
+#----------------------------------------
+#   inconslusive  |  ie   |  i_f  |  ii
+
+# Null: VE >= 0.3
+# Estimate\Truth       | Effi + inc (True) | Futi (False) 
+#------------------------------------------------------------
+# Effi + inc (Fail Rej)|  ee + ei + ie + ii |  ef + i_f 
+#------------------------------------------------------------
+#    Futi (Rej)        |  fe + fi           |  ff  
+
+# Type I error = Dec Rej & Null true / (Dec Rej & Null true + Dec Fail Rej & Null True)
+#              = (fe + fi) / (fe + fi + ee + ei + ie + ii)
+
+bayes_fu_typeI <- (z$fe + z$fi)/(z$fe + z$fi + z$ee + z$ei + z$ie + z$ii)
+print(paste("The Type I error under the null of VE >= 0.3 is:", bayes_fu_typeI))
+
+# Type II error = Dec fail Rej & Null false / (Dec fail Rej & Null false + Dec Rej & Null false)
+#               = (ef + i_f) / (ef + i_f + ff)
+
+bayes_fu_typeII <- (z$ef + z$i_f)/(z$ef + z$i_f + z$ff)
+print(paste("The Type II error under the null of VE >= 0.3 is:", bayes_fu_typeII))
+
+# Null: VE <= 0.5
+# Estimate\Truth       | Futi + inc (True)   | Effi (False) 
+#------------------------------------------------------------
+# Futi + inc (Fail Rej)|  ff + fi + i_f + ii |  fe + ie 
+#------------------------------------------------------------
+#    Effi (Rej)        |  ef + ei            |  ee  
+
+# Type I error = Dec Rej & Null true / (Dec Rej & Null true + Dec Fail Rej & Null True)
+#              = (ef + ei) / (ef + ei + ff + fi + i_f + ii)
+
+bayes_eff_typeI <- (z$ef + z$ei)/(z$ef + z$ei + z$ff + z$fi + z$i_f + z$ii)
+print(paste("The Type I error under the null of VE <= 0.5 is:", bayes_eff_typeI))
+
+# Type II error = Dec fail Rej & Null false / (Dec fail Rej & Null false + Dec Rej & Null false)
+#               = (fe + ie) / (fe + ie + ee)
+
+bayes_eff_typeII <- (z$fe + z$ie)/(z$fe + z$ie + z$ee)
+print(paste("The Type II error under the null of VE <= 0.5 is:", bayes_eff_typeII))
+
+
+status <- z$status
+k <- z$status == 2 & z$stopped < 18000
+kf <- z$status == 1 & z$stopped < 18000
+
+# Trials stopped early for efficacy
+print(paste("The number of trials with early stopping for efficacy is:", sum(k)))
+# Trails stopped early for futility
+print(paste("The number of trials with early stopping for futility is:", sum(kf)))
+# Average post prob. of efficacy at stopping for efficacy:
+#print(paste("The avg post efficacy at early stopping for efficacy is:", mean(z$postfe[k])))
+# Average post prob. of futility at stopping for futility:
+#print(paste("The avg post futility at early stopping for futility is:", mean(z$postf[kf])))
+
+# Print early stopping for each interim
+print("The stopping number of each interim:")
+print(sum(z$stopped == 3000))
+print(sum(z$stopped == 6000))
+print(sum(z$stopped == 9000))
+print(sum(z$stopped == 12000))
+print(sum(z$stopped == 15000))
+print(sum(z$stopped == 18000))
+
+# Average stopping time
+print(paste("Average stopping sample size", mean(z$stopped)))
+
+# Print early stopping for each interim for different status
+# Stop for futility
+print("The stopping number of each interim for futility:")
+print(sum(z$stopped == 3000 & z$status == 1))
+print(sum(z$stopped == 6000 & z$status == 1))
+print(sum(z$stopped == 9000 & z$status == 1))
+print(sum(z$stopped == 12000 & z$status == 1))
+print(sum(z$stopped == 15000 & z$status == 1))
+print(sum(z$stopped == 18000 & z$status == 1))
+
+print(paste("Average stopping sample size for futility early stopping", mean(z$stopped[kf])))
+# Stop for efficicous
+print("The stopping number of each interim for efficacy:")
+print(sum(z$stopped == 3000 & z$status == 2))
+print(sum(z$stopped == 6000 & z$status == 2))
+print(sum(z$stopped == 9000 & z$status == 2))
+print(sum(z$stopped == 12000 & z$status == 2))
+print(sum(z$stopped == 15000 & z$status == 2))
+print(sum(z$stopped == 18000 & z$status == 2))
+
+print(paste("Average stopping sample size for efficacy early stopping", mean(z$stopped[k])))
+
+# Overall accuracy
+# print(sum(z$truth - z$status)/10000)
+```
+```
