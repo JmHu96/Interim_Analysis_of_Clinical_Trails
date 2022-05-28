@@ -1,7 +1,7 @@
 ---
 title: "Bayesian_Final Code"
-author: "Dehua Bi"
-date: "13/03/2021"
+author: "Jiaming Hu"
+date: "03/13/2021"
 output: html_document
 ---
 

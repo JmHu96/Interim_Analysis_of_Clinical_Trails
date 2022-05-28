@@ -1,7 +1,7 @@
 ---
 title: "Frequentist_Final"
-author: "Dehua Bi"
-date: "08/03/2021"
+author: "Jiaming Hu"
+date: "03/08/2021"
 output: html_document
 ---
 
